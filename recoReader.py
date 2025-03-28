@@ -19,6 +19,15 @@ import time
 from collections import Counter
 
 
+
+from azure.cosmos import CosmosClient  
+import os 
+cosmos = CosmosClient(os.environ["COSMOS_URI"], os.environ["COSMOS_KEY"]) 
+container = cosmos.get_database_client(os.environ["COSMOS_DB"]).get_container_client(os.environ["COSMOS_CONTAINER"]) 
+
+
+
+
 _RECO_LAYOUT = ["version_nb", "search_id", "search_country",
                 "search_date", "search_time", "origin_city", "destination_city", "request_dep_date",
                 "request_return_date", "passengers_string",
@@ -325,5 +334,7 @@ if __name__ == "__main__":
 
     for _search in process(arguments):
         # encode and print
-        print(encoder(_search))
+        output=encoder(_search)
+        print(output)
+        container.upsert_item(output)
 
