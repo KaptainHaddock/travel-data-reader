@@ -1,0 +1,13 @@
+{
+    "bindings": [
+      {
+        "type": "eventHubTrigger",
+        "name": "event",
+        "direction": "in",
+        "eventHubName": "recos-stream",
+        "connection": "EventHubConnectionString",
+        "consumerGroup": "$Default"
+      }
+    ]
+  }
+  
