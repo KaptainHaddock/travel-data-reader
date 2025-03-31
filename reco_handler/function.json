@@ -1,13 +1,17 @@
 {
-    "bindings": [
-      {
-        "type": "eventHubTrigger",
-        "name": "event",
-        "direction": "in",
-        "eventHubName": "recos-stream",
-        "connection": "EventHubConnectionString",
-        "consumerGroup": "$Default"
-      }
-    ]
-  }
-  
+  "bindings": [
+    {
+      "authLevel": "function",
+      "type": "httpTrigger",
+      "direction": "in",
+      "name": "req",
+      "methods": ["post"],
+      "route": "process-recos"
+    },
+    {
+      "type": "http",
+      "direction": "out",
+      "name": "$return"
+    }
+  ]
+}
