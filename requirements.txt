@@ -1,4 +1,0 @@
-neobase
-pytest
-azure-functions
-
