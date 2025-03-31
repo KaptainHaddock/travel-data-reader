@@ -4,7 +4,7 @@ import sys
 import gzip
 import json
 import datetime
-# import neobase
+import neobase
 import os
 import time
 import tempfile
@@ -25,13 +25,13 @@ logging.basicConfig(format='%(levelname)-8s [%(filename)s:%(lineno)d] %(message)
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
  
-""""neob = None
+neob = None
 def get_neob():
     global neob
     if neob is None:
         logger.info("Init geography module neobase")
         neob = neobase.NeoBase()
-    return neob """
+    return neob 
  
 # Currency rates
 def load_rates(rates_file):
@@ -93,11 +93,11 @@ def group_and_decorate(recos_in, rates):
     search["trip_type"] = "OW" if search["stay_duration"] == -1 else "RT"
  
     search['passengers'] = [{"passenger_type": p.split("=")[0], "passenger_nb": int(p.split("=")[1])} for p in search['passengers_string'].rstrip().split(',')]
-    """ search["origin_country"] = get_neob().get(search["origin_city"], 'country_code')
+    search["origin_country"] = get_neob().get(search["origin_city"], 'country_code')
     search["destination_country"] = get_neob().get(search["destination_city"], 'country_code')
     search["geo"] = "D" if search["origin_country"] == search["destination_country"] else "I" 
     search["OnD"] = f"{search['origin_city']}-{search['destination_city']}"
-    search["OnD_distance"] = round(get_neob().distance(search["origin_city"], search["destination_city"])) """
+    search["OnD_distance"] = round(get_neob().distance(search["origin_city"], search["destination_city"]))
  
     return search
  
@@ -132,7 +132,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     class Args:
         def __init__(self, input_file):
             self.input_file = input_file
-            self.rates_file = os.path.join(os.path.dirname(__file__), "etc/eurofxref.csv")
+            self.rates_file = os.path.join(os.path.dirname(__file__), "../etc/eurofxref.csv")
  
     results = [search for search in process(Args(temp_filename))]
     os.unlink(temp_filename)
