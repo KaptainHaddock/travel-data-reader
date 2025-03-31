@@ -4,12 +4,26 @@ import sys
 import gzip
 import json
 import datetime
-import neobase
 import os
 import time
 import tempfile
 from collections import Counter
- 
+
+# Attempt to import neobase with error handling
+try:
+    import neobase
+    _HAS_NEOBASE = True
+except ImportError:
+    _HAS_NEOBASE = False
+    logging.warning("neobase module not available. Geography features will be limited.")
+    # Define a simple fallback class
+    class NeoBaseFallback:
+        def get(self, city, field):
+            return "XX"  # Default country code
+        
+        def distance(self, origin, destination):
+            return 0  # Default distance
+
 _RECO_LAYOUT = ["version_nb", "search_id", "search_country",
                 "search_date", "search_time", "origin_city", "destination_city", "request_dep_date",
                 "request_return_date", "passengers_string",
@@ -30,8 +44,12 @@ def get_neob():
     global neob
     if neob is None:
         logger.info("Init geography module neobase")
-        neob = neobase.NeoBase()
-    return neob 
+        if _HAS_NEOBASE:
+            neob = neobase.NeoBase()
+        else:
+            logger.warning("Using fallback geography module")
+            neob = NeoBaseFallback()
+    return neob
  
 # Currency rates
 def load_rates(rates_file):
@@ -61,7 +79,7 @@ def decode_line(line):
         reco = dict(zip(_RECO_LAYOUT, array))
         read_columns_nb=len(_RECO_LAYOUT)
         reco["nb_of_flights"] = int(reco["nb_of_flights"])
-        reco["flights"]=[]
+        reco["flights"]=[] 
         for i in range(reco["nb_of_flights"]):
             flight=dict(zip(_FLIGHT_LAYOUT, array[read_columns_nb:]))
             read_columns_nb+=len(_FLIGHT_LAYOUT)
@@ -117,24 +135,40 @@ def process(args):
                 if reco["search_id"] != current_search_id:
                     current_search_id = reco["search_id"]
                     if recos:
-                        yield group_and_decorate(recos, rates)
+                        search = group_and_decorate(recos, rates)
+                        if search:
+                            yield search
                         recos = []
                 recos.append(reco)
     if recos:
-        yield group_and_decorate(recos, rates)
- 
+        search = group_and_decorate(recos, rates)
+        if search:
+            yield search
+
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    file_data = req.get_body()
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.gz') as temp_file:
-        temp_file.write(file_data)
-        temp_filename = temp_file.name
- 
-    class Args:
-        def __init__(self, input_file):
-            self.input_file = input_file
-            self.rates_file = os.path.join(os.path.dirname(__file__), "../etc/eurofxref.csv")
- 
-    results = [search for search in process(Args(temp_filename))]
-    os.unlink(temp_filename)
- 
-    return func.HttpResponse(body=json.dumps(results), mimetype="application/json", status_code=200)
+    try:
+        file_data = req.get_body()
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.gz') as temp_file:
+            temp_file.write(file_data)
+            temp_filename = temp_file.name
+
+        class Args:
+            def __init__(self, input_file):
+                self.input_file = input_file
+                self.rates_file = os.path.join(os.path.dirname(__file__), "../etc/eurofxref.csv")
+
+        try:
+            results = [search for search in process(Args(temp_filename))]
+        finally:
+            # Make sure we always clean up the temp file
+            if os.path.exists(temp_filename):
+                os.unlink(temp_filename)
+
+        return func.HttpResponse(body=json.dumps(results), mimetype="application/json", status_code=200)
+    except Exception as e:
+        logging.error(f"Error processing request: {str(e)}")
+        return func.HttpResponse(
+            body=json.dumps({"error": str(e)}),
+            mimetype="application/json",
+            status_code=500
+        )
