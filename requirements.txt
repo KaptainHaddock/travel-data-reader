@@ -1,4 +1,4 @@
-git+https://github.com/alexprengere/neobase.git
+neobase
 pytest
 azure-functions
 
