@@ -1,10 +1,417 @@
-import logging
 import azure.functions as func
-
-def main(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("🎉 Requête reçue avec succès dans Azure Function HTTP !")
-
-    return func.HttpResponse(
-        "✅ Hello Vincent ! Ta fonction fonctionne 🎯",
-        status_code=200
-    )
+import logging
+import argparse
+import sys
+import gzip
+import json
+import datetime
+import neobase
+import os
+import time
+from collections import Counter
+ 
+ 
+_RECO_LAYOUT = ["version_nb", "search_id", "search_country",
+                "search_date", "search_time", "origin_city", "destination_city", "request_dep_date",
+                "request_return_date", "passengers_string",
+                "currency", "price", "taxes", "fees", "nb_of_flights"]
+ 
+_FLIGHT_LAYOUT = ["dep_airport", "dep_date", "dep_time",
+                  "arr_airport", "arr_date", "arr_time",
+                  "operating_airline", "marketing_airline", "flight_nb", "cabin"]
+ 
+# Log init
+logging.basicConfig(format='%(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
+                    datefmt='%Y-%m-%d:%H:%M:%S',
+                    level=logging.DEBUG)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+ 
+ 
+app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+ 
+@app.route(route="Corepy_http_trigger", methods=["POST"])
+def Corepy_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Python HTTP trigger function processed a request.')
+ 
+    # Set CORS headers
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
+    }
+ 
+    # Handle OPTIONS request for CORS preflight
+    if req.method == "OPTIONS":
+        return func.HttpResponse(
+            body="",
+            status_code=200,
+            headers=headers
+        )
+ 
+    # Check if the request method is POST
+    if req.method != "POST":
+        return func.HttpResponse(
+            "This function only accepts POST requests.",
+            status_code=405,
+            headers=headers
+        )
+ 
+    # Check if there's a file in the request
+    try:
+        # Get the file from the request
+        file_data = req.get_body()
+        if not file_data:
+            return func.HttpResponse(
+                json.dumps({"error": "No file data found in the request"}),
+                status_code=400,
+                mimetype="application/json",
+                headers=headers
+            )
+    except Exception as e:
+        logging.error(f"Error processing request data: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": f"Error processing request data: {str(e)}"}),
+            status_code=400,
+            mimetype="application/json",
+            headers=headers
+        )
+   
+    # Create a temporary file to store the uploaded data
+    import tempfile
+   
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.gz') as temp_file:
+        temp_file.write(file_data)
+        temp_filename = temp_file.name
+   
+    # Define args similar to command line arguments
+    class Args:
+        def __init__(self, input_file, format="json", rates_file=None):
+            self.input_file = input_file
+            self.format = format
+            # Use default rates file
+            if rates_file is None:
+                self.rates_file = os.path.join(os.path.dirname(__file__), "etc/eurofxref.csv")
+            else:
+                self.rates_file = rates_file
+   
+    # Get requested format from query parameters
+    format_param = req.params.get('format', 'json')
+    if format_param not in encoders:
+        format_param = 'json'
+   
+    # Create arguments
+    args = Args(input_file=temp_filename, format=format_param)
+   
+    try:
+        # Process the data
+        results = []
+        for search in process(args):
+            results.append(search)
+       
+        # Encode the results using the specified encoder
+        encoder = encoders[args.format]
+        if len(results) == 1:
+            # Single result
+            response_body = encoder(results[0])
+        else:
+            # Multiple results, wrap in an array
+            response_body = json.dumps(results) if args.format == 'json' else '\n'.join([encoder(r) for r in results])
+       
+        # Clean up the temporary file
+        os.unlink(temp_filename)
+       
+        return func.HttpResponse(
+            body=response_body,
+            mimetype="application/json",
+            status_code=200,
+            headers=headers
+        )
+    except Exception as e:
+        logging.exception(f"Error processing travel data: {str(e)}")
+        # Clean up the temporary file in case of error
+        if os.path.exists(temp_filename):
+            os.unlink(temp_filename)
+       
+        return func.HttpResponse(
+            json.dumps({"error": f"Error processing travel data: {str(e)}"}),
+            mimetype="application/json",
+            status_code=500,
+            headers=headers
+        )
+ 
+neob = None
+def get_neob():
+    """
+    Inits geography module if necessary
+    :return: neob: neobase object to be used for geo conversions
+    """
+    global neob
+    # geography module init
+    if neob is None:
+        logger.info("Init geography module neobase")
+        neob = neobase.NeoBase()
+    return neob
+ 
+ 
+# Currency rates
+def load_rates(rates_file):
+    """
+    Decodes currency rate file as provided by the BCE from https://www.ecb.europa.eu/stats/eurofxref/eurofxref.zip
+    :param: rates_file: name of the rates CSV file
+    :return: rates: dict currency code -> rate
+    """
+   
+    header = None
+    rates = []
+    with open(rates_file, 'r') as f:
+        for line in f:
+            array = line.rstrip().split(',')
+            if len(array)<=1: return None # skip empty line
+            array = [x.lstrip() for x in array if x != ""] # removing heading white spaces
+            if header == None:
+                # first line is the header: Date, USD, JPY, BGN, CZK, DKK, ...
+                header = array
+            else:
+                # next lines are date and rates: 19 November 2021, 1.1271, 128.22, 1.9558, 25.413, 7.4366, ...
+                # convert date into reasonable format
+                rate_date = datetime.datetime.strptime(array[0], "%d %B %Y").strftime("%Y-%m-%d")
+                # convert next fields to float
+                array = [rate_date] + list(map(float, array[1:]))
+                # zip with header
+                rates.append(dict(zip(header, array)))
+ 
+    # only returns the last date for this simple version
+    rates = rates[-1]
+    logger.info("Currency rates loaded: %s" % rates)
+    return rates
+ 
+ 
+# CSV decoding
+def decode_line(line):
+    """
+    Decodes a CSV line based on _RECO_LAYOUT and _FLIGHT_LAYOUT
+    :param line: string containing a CSV line
+    :return reco: dict with decoded CSV fields
+    """
+   
+    try:
+        # converting to text string
+        if isinstance(line, bytes):
+            line = line.decode()
+ 
+        # splitting the CSV line
+        array=line.rstrip().split('^')
+        if len(array)<=1:
+            logger.warning("Empty line")
+            return None # skip empty line
+   
+        # decoding fields prior to flight details
+        reco = dict(zip(_RECO_LAYOUT, array))
+        read_columns_nb=len(_RECO_LAYOUT)
+ 
+        # convert to integer
+        reco["nb_of_flights"] = int(reco["nb_of_flights"])
+ 
+        # decoding flights details
+        reco["flights"]=[]
+        for i in range(0, reco["nb_of_flights"]):
+            flight=dict(zip(_FLIGHT_LAYOUT, array[read_columns_nb:]))
+            read_columns_nb+=len(_FLIGHT_LAYOUT)
+            reco["flights"].append(flight)
+ 
+    except:
+        logger.exception("Failed at decoding CSV line: %s" % line.rstrip())
+        return None
+       
+    return reco
+   
+ 
+# Reco processing
+_SEARCH_FIELDS = ["version_nb", "search_id", "search_country",
+                  "search_date", "search_time", "origin_city", "destination_city", "request_dep_date",
+                  "request_return_date", "passengers_string", "currency"]
+ 
+ 
+def group_and_decorate(recos_in, rates):
+    """
+    Groups recos to build a search object. Adds interesting fields.
+    :param recos_in: set of dict (decoded travel recommendations belonging to the same search)
+    :return search: decorated dict describing a search
+    """
+   
+    # don't decorate empty search or empty recos
+    if recos_in is None or len(recos_in) == 0:
+        return None
+    recos = [reco for reco in recos_in if reco is not None]
+   
+    def to_euros(amount):
+        if search["currency"] == "EUR":
+            return amount
+        else:
+            # Handle case where currency might not be in rates
+            if search["currency"] not in rates:
+                logging.warning(f"Currency {search['currency']} not found in rates. Using 1.0 as rate.")
+                return round(amount, 2)
+            return round(amount / rates[search["currency"]], 2)
+ 
+    try:
+        # some fields are common to the search, others are specific to recos
+        # taking search fields from the first reco
+        search = {key: value for key, value in recos[0].items() if key in _SEARCH_FIELDS}
+        # keeping other fields only in reco
+        search["recos"] = [{key: value for key, value in reco.items() if key not in _SEARCH_FIELDS} for reco in recos]
+ 
+        # advance purchase & stay duration & OW/RT
+        search_date = datetime.datetime.strptime(search["search_date"],'%Y-%m-%d')
+        request_dep_date = datetime.datetime.strptime(search["request_dep_date"],'%Y-%m-%d')
+        # approximate since the dep date is local to the origin city (whereas the search date is UTC)
+        search["advance_purchase"] = (request_dep_date - search_date).days
+        if search["request_return_date"] == "":
+            search["stay_duration"] = -1
+            search["trip_type"] = "OW" # One Way trip
+        else:
+            request_return_date = datetime.datetime.strptime(search["request_return_date"],'%Y-%m-%d')
+            # approximative since the return date is local to the destination city
+            search["stay_duration"] = (request_return_date - request_dep_date).days
+            search["trip_type"] = "RT" # Round trip
+ 
+        # decoding passengers string: "ADT=1,CH=2" means 1 Adult and 2 children
+        passengers = []
+        for pax_string in search['passengers_string'].rstrip().split(','):
+            pax_array = pax_string.split("=")
+            passengers.append({"passenger_type" : pax_array[0], "passenger_nb" : int(pax_array[1])})
+        search['passengers'] = passengers
+       
+        # countries
+        search["origin_country"] = get_neob().get(search["origin_city"], 'country_code')
+        search["destination_country"] = get_neob().get(search["destination_city"], 'country_code')
+        # geo: D=Domestic I=International
+        search["geo"] = "D" if search["origin_country"] == search["destination_country"] else "I"
+ 
+        # OnD (means Origin and Destination. E.g. "PAR-NYC")
+        search["OnD"] = f"{search['origin_city']}-{search['destination_city']}"
+        search["OnD_distance"] = round(get_neob().distance(search["origin_city"], search["destination_city"]))
+ 
+    except:
+        logger.exception("Failed at buidlding search from: %s" % recos[0])
+        # filter out recos when we fail at decorating them
+        return None
+ 
+    # reco decoration
+    for reco in search["recos"]:
+ 
+        try:
+            # currency conversion
+            for field in ["price", "taxes", "fees"]:
+                reco[field] = float(reco[field])
+                reco[field + "_EUR"] = to_euros(reco[field])
+ 
+            # will be computed from flights
+            marketing_airlines = {}
+            operating_airlines = {}
+            cabins = {}
+            reco['flown_distance'] = 0
+ 
+            # flight decoration
+            for f in reco["flights"]:
+                # getting cities (a city can have several airports like PAR has CDG and ORY)
+                f["dep_city"] = get_neob().get(f["dep_airport"], 'city_code_list')[0]
+                f["arr_city"] = get_neob().get(f["arr_airport"], 'city_code_list')[0]
+               
+                f["distance"] = round(get_neob().distance(f["dep_airport"], f["arr_airport"]))
+                reco['flown_distance'] += f["distance"]
+                marketing_airlines[f["marketing_airline"]] = marketing_airlines.get(f["marketing_airline"], 0) + f["distance"]
+                if f["operating_airline"] == "":
+                    f["operating_airline"] = f["marketing_airline"]
+                operating_airlines[f["operating_airline"]] = operating_airlines.get(f["operating_airline"], 0) + f["distance"]
+                cabins[f["cabin"]] = cabins.get(f["cabin"], 0) + f["distance"]
+ 
+            # the main airline is the one that covers the longuest part of the trip
+            reco["main_marketing_airline"] = max(marketing_airlines, key=marketing_airlines.get)
+            reco["main_operating_airline"] = max(operating_airlines, key=operating_airlines.get)
+            reco["main_cabin"] = max(cabins, key=cabins.get)
+ 
+        except:
+            logger.exception("Failed at decorating reco: %s" % reco)
+            # filter out recos when we fail at decorating them
+            return None
+       
+    return search
+ 
+ 
+# Encoders
+# Different ways to print the output. You can easily add one.
+ 
+def encoder_json(search):
+    return json.dumps(search)
+ 
+ 
+def encoder_pretty_json(search):
+    return json.dumps(search, indent=2)
+ 
+ 
+def encoder_test(search):
+    return search["currency"]
+ 
+ 
+# encoders list
+encoders = {"json": encoder_json,
+            "pretty_json": encoder_pretty_json,
+            "test": encoder_test
+            }
+ 
+ 
+# Main function
+def process(args):
+    """
+    Main process: reads, decodes, groups into search and decorates
+    :param args: script arguments
+    :return searches: iterator on search objects (returned with yield)
+    """
+ 
+    # start time
+    start = time.time()
+ 
+    # loading currency rates
+    rates = load_rates(args.rates_file)
+ 
+    logger.info("Decoding/encoding")
+ 
+    cnt = Counter()
+    recos = []
+    current_search_id = 0
+    # open input file (or stdin if there is none)
+    with gzip.open(args.input_file, 'r') if args.input_file is not "-" else sys.stdin as f:
+        for line in f:
+            cnt['reco_read'] += 1
+            reco = decode_line(line)
+            if reco:
+                cnt['reco_decoded'] += 1
+                # new search_id means new search: we can process the collected recos
+                if reco["search_id"] != current_search_id:
+                    current_search_id = reco["search_id"]
+                    if len(recos) > 0:
+                        if cnt['search_read'] % 1000 == 0:
+                            # log every 1000 searches to show the script is alive
+                            logger.info(f"Running: %s" % cnt)
+                        cnt['search_read'] += 1
+                        search = group_and_decorate(recos, rates)
+                        if search:
+                            cnt['search_encoded'] += 1
+                            yield search
+                        recos = []
+                recos.append(reco)
+ 
+    # Let's not forget the last search
+    if len(recos) > 0:
+        cnt['search_read'] += 1
+        search = group_and_decorate(recos, rates)
+        if search:
+            cnt['search_encoded'] += 1
+            yield search
+ 
+    # end time
+    end = time.time()
+ 
+    logger.info(f"Finished in {round(end - start, 2)} seconds: %s" % cnt)
