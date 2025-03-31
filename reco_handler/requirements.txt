@@ -1,4 +1,3 @@
-neobase
 pytest
 azure-functions
 
